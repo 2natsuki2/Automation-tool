@@ -1,0 +1,195 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+
+# Matplotlibの日本語設定
+try:
+    import japanize_matplotlib
+    japanize_matplotlib.japanize()
+except ImportError:
+    print("japanize_matplotlib がインストールされていません。グラフの日本語が文字化けする可能性があります。")
+    # 代替フォント設定（環境に応じて変更が必要）
+    plt.rcParams['font.sans-serif'] = ['Hiragino Maru Gothic Pro', 'Yu Gothic', 'MS Gothic', 'sans-serif']
+
+
+# --- ステップ1 & 2: データの読み込み、理解(EDA)、前処理 ---
+
+# 1. データの読み込みと基本情報確認
+print("--- 1. データの読み込みと基本情報確認 ---")
+df = pd.read_csv('ett.csv')
+
+# dateカラムをdatetime型に変換し、インデックスに設定
+df['date'] = pd.to_datetime(df['date'])
+df = df.set_index('date')
+
+print("データ概要:")
+print(df.info())
+print("\n基本統計量:")
+print(df.describe())
+
+# 2. 特徴量エンジニアリング：時間に関する特徴量の作成
+print("\n--- 2. 時間に関する特徴量の作成 ---")
+df['month'] = df.index.month
+df['day'] = df.index.day
+df['dayofweek'] = df.index.dayofweek
+df['hour'] = df.index.hour
+print("時間特徴量を追加後のデータ（先頭5行）:")
+print(df.head())
+
+
+# 3. データの分割（訓練・検証・テスト）
+# 時系列データのため、シャッフルせずに時間順で分割
+train_val_df, test_df = train_test_split(df, test_size=0.2, shuffle=False)
+train_df, val_df = train_test_split(train_val_df, test_size=0.125, shuffle=False) # (0.1 / 0.8)
+
+# 4. 特徴量とターゲットの定義
+features = [col for col in df.columns if col != 'OT']
+target = 'OT'
+
+X_train = train_df[features]
+y_train = train_df[target]
+X_val = val_df[features]
+y_val = val_df[target]
+X_test = test_df[features]
+y_test = test_df[target]
+
+# 5. スケーリング
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
+
+# スケーリング後のデータをDataFrameに戻す（可視化やLGBMでカラム名を使うため）
+X_train_scaled = pd.DataFrame(X_train_scaled, index=X_train.index, columns=features)
+X_val_scaled = pd.DataFrame(X_val_scaled, index=X_val.index, columns=features)
+X_test_scaled = pd.DataFrame(X_test_scaled, index=X_test.index, columns=features)
+
+
+# --- ステップ3: モデル選定とトレーニング ---
+
+# --- 3.1. ベースラインモデル: LightGBM ---
+print("\n--- 3.1. LightGBMモデルの学習 ---")
+lgb_model = lgb.LGBMRegressor(random_state=42)
+lgb_model.fit(X_train_scaled, y_train,
+              eval_set=[(X_val_scaled, y_val)],
+              eval_metric='mae',
+              callbacks=[lgb.early_stopping(10, verbose=False)])
+
+
+# --- 3.2. 時系列特化モデル: LSTM ---
+print("\n--- 3.2. LSTMモデルの学習 ---")
+# LSTM用のデータ準備（シーケンスデータ作成）
+def create_sequences(X, y, time_steps=24):
+    Xs, ys = [], []
+    for i in range(len(X) - time_steps):
+        Xs.append(X.iloc[i:(i + time_steps)].values)
+        ys.append(y.iloc[i + time_steps])
+    return np.array(Xs), np.array(ys)
+
+TIME_STEPS = 24
+X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train, TIME_STEPS)
+X_val_seq, y_val_seq = create_sequences(X_val_scaled, y_val, TIME_STEPS)
+X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test, TIME_STEPS)
+
+# LSTMモデルの構築
+lstm_model = Sequential()
+lstm_model.add(LSTM(50, activation='relu', input_shape=(X_train_seq.shape[1], X_train_seq.shape[2])))
+lstm_model.add(Dense(1))
+lstm_model.compile(optimizer='adam', loss='mse')
+
+# LSTMモデルの学習
+lstm_model.fit(X_train_seq, y_train_seq,
+               epochs=20,
+               batch_size=32,
+               validation_data=(X_val_seq, y_val_seq),
+               verbose=1,
+               shuffle=False)
+
+
+# --- ステップ4: モデルの評価と結果の分析 ---
+print("\n--- 4. 初期モデルの評価 ---")
+
+# LightGBMの予測
+y_pred_lgb = lgb_model.predict(X_test_scaled)
+rmse_lgb = np.sqrt(mean_squared_error(y_test, y_pred_lgb))
+mae_lgb = mean_absolute_error(y_test, y_pred_lgb)
+print(f"LightGBM - RMSE: {rmse_lgb:.3f}, MAE: {mae_lgb:.3f}")
+
+# LSTMの予測
+y_pred_lstm_seq = lstm_model.predict(X_test_seq)
+# 評価のためにy_testの長さをシーケンスに合わせる
+y_test_eval_lstm = y_test.iloc[TIME_STEPS:]
+rmse_lstm = np.sqrt(mean_squared_error(y_test_eval_lstm, y_pred_lstm_seq))
+mae_lstm = mean_absolute_error(y_test_eval_lstm, y_pred_lstm_seq)
+print(f"LSTM - RMSE: {rmse_lstm:.3f}, MAE: {mae_lstm:.3f}")
+
+
+# 予測結果の可視化
+plt.figure(figsize=(15, 7))
+plt.plot(y_test.index, y_test, label='実績値', color='blue', alpha=0.7)
+plt.plot(y_test.index, y_pred_lgb, label=f'LightGBM予測 (MAE:{mae_lgb:.3f})', color='darkorange', linestyle='--')
+plt.plot(y_test_eval_lstm.index, y_pred_lstm_seq, label=f'LSTM予測 (MAE:{mae_lstm:.3f})', color='green', linestyle=':')
+plt.title('初期モデルの予測結果比較（テストデータ）')
+plt.xlabel('日付')
+plt.ylabel('オイル温度 (OT)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+# --- ステップ5: 改善策の検討とモデルの再トレーニング ---
+print("\n--- 5. 改善モデル（ラグ特徴量追加）の学習と評価 ---")
+
+# ラグ特徴量（1時間前のOT）を作成
+df_improved = df.copy()
+df_improved['OT_lag_1'] = df_improved['OT'].shift(1)
+df_improved = df_improved.dropna() # 最初の行はNaNになるので削除
+
+# 再度データを分割
+train_val_df_imp, test_df_imp = train_test_split(df_improved, test_size=0.2, shuffle=False)
+train_df_imp, val_df_imp = train_test_split(train_val_df_imp, test_size=0.125, shuffle=False)
+
+features_imp = [col for col in df_improved.columns if col != 'OT']
+X_train_imp, y_train_imp = train_df_imp[features_imp], train_df_imp[target]
+X_val_imp, y_val_imp = val_df_imp[features_imp], val_df_imp[target]
+X_test_imp, y_test_imp = test_df_imp[features_imp], test_df_imp[target]
+
+# 再度スケーリング
+scaler_imp = StandardScaler()
+X_train_scaled_imp = scaler_imp.fit_transform(X_train_imp)
+X_val_scaled_imp = scaler_imp.transform(X_val_imp)
+X_test_scaled_imp = scaler_imp.transform(X_test_imp)
+
+# 改善モデルの学習
+lgb_model_imp = lgb.LGBMRegressor(random_state=42)
+lgb_model_imp.fit(X_train_scaled_imp, y_train_imp,
+                  eval_set=[(X_val_scaled_imp, y_val_imp)],
+                  eval_metric='mae',
+                  callbacks=[lgb.early_stopping(10, verbose=False)])
+
+# 改善モデルの評価
+y_pred_lgb_imp = lgb_model_imp.predict(X_test_scaled_imp)
+rmse_lgb_imp = np.sqrt(mean_squared_error(y_test_imp, y_pred_lgb_imp))
+mae_lgb_imp = mean_absolute_error(y_test_imp, y_pred_lgb_imp)
+print(f"改善後 LightGBM - RMSE: {rmse_lgb_imp:.3f}, MAE: {mae_lgb_imp:.3f}")
+
+
+# 最終的な予測結果の可視化
+plt.figure(figsize=(15, 7))
+plt.plot(y_test_imp.index, y_test_imp, label='実績値', color='blue', alpha=0.7)
+plt.plot(y_test_imp.index, y_pred_lgb_imp, label=f'改善後LGBM予測 (MAE:{mae_lgb_imp:.3f})', color='red', linestyle='--')
+# 比較のため改善前の予測もプロット
+plt.plot(y_test.index, y_pred_lgb, label=f'改善前LGBM予測 (MAE:{mae_lgb:.3f})', color='darkorange', linestyle=':', alpha=0.5)
+plt.title('改善後モデルの予測結果（テストデータ）')
+plt.xlabel('日付')
+plt.ylabel('オイル温度 (OT)')
+plt.legend()
+plt.grid(True)
+plt.show()
