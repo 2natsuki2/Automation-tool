@@ -1,0 +1,1220 @@
+import pandas as pd
+from openpyxl import Workbook, load_workbook
+from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.styles import PatternFill
+import traceback
+import math
+import re
+import os
+import tkinter as tk
+from tkinter import messagebox
+import logging
+
+# Setting Logger
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Global Constants ---
+EXPECTED_ENTRIES_PER_ROW = 64 # Expected number of entries per column (64 columns)
+NUM_INPUT_ROWS = 6 # Number of GUI input rows (corresponds to S6, S7, S8, S9, S11, S12)
+EXPECTED_TOTAL_FIXED_STRINGS = EXPECTED_ENTRIES_PER_ROW * NUM_INPUT_ROWS # Total number of GUI input elements
+
+# Excel sheet target rows for GUI input (corresponds to 6 GUI input rows)
+TARGET_EXCEL_ROWS = [6, 7, 8, 9, 11, 12]
+
+# Priority Excel read settings
+EXCEL_PRIORITY_READ_CONFIG = {
+    "sheet_name": "Sheet1",
+    "ranges": [
+        "B2:BM2",   # Msg. Label (corresponds to S6)
+        "B3:BM3",   # CANID (corresponds to S7)
+        "B4:BM4",   # Cycle (corresponds to S8)
+        "B5:BM5",   # Offset (corresponds to S9)
+        "B7:BM7",   # KZK (corresponds to S11)
+        "B8:BM8",   # Available (corresponds to S12)
+    ]
+}
+
+# ASC data processing constants
+ASC_SKIP_INITIAL_LINES = 10
+ASC_EXTRACT_CHARS_FROM_LEFT = 50
+ASC_MIN_VALID_LINE_LENGTH = 40
+ASC_REQUIRED_COMMON_STRINGS_FIXED = ["CANFD"]
+ASC_INTERNAL_DELIMITER = ','
+ASC_COLUMN_NAMES = ['Timestamp', 'CAN_Type', 'Channel', 'Direction', 'Data_ID', 'Signal_Name']
+ASC_EXPECTED_FIELD_COUNT = len(ASC_COLUMN_NAMES)
+
+# Excel output constants
+OUTPUT_CHECK_SHEET_NAME = 'check'
+# Processed data paste start row (C28)
+OUTPUT_START_ROW_PROCESSED_DATA_C28 = 28
+OUTPUT_START_COL_LETTER_PROCESSED_DATA_C28 = 'C'
+
+# Constants for writing aggregated results (Count, MIN, MAX, AVE, Delta) from column O
+OUTPUT_START_ROW_AGGREGATED_DATA = 17 # Row number corresponding to Count (S17)
+OUTPUT_START_COL_LETTER_AGGREGATED_DATA = 'O' 
+
+# Constants for writing Processed data (for Grouped_Time_Difference) from column O
+OUTPUT_START_ROW_PROCESSED_DATA_O28 = 28 
+OUTPUT_START_COL_LETTER_PROCESSED_DATA_O28 = 'O' 
+
+
+# List of row numbers for writing Signal Names (S16 and S27)
+OUTPUT_ROWS_FOR_SIGNAL_NAMES_AGGREGATED_DATA = [16, 27]
+
+NO_FILL = PatternFill(fill_type=None)
+
+# ==============================================================================
+# The process_asc_data function is revised to perform exact match filtering of Signal_Name.
+# ==============================================================================
+def process_asc_data(input_asc_filepath, selected_filter_strings, interruption_check=None):
+    """
+    Reads the specified ASC file and returns processed data as a Pandas DataFrame.
+    The following filtering and processing rules are applied:
+    - Skip the first 10 lines
+    - Read only the first 50 characters of each line
+    - Retain only lines that **exactly match** one of the Signal_Names in selected_filter_strings, and whose string length also matches.
+    - Replace each block of spaces with a single comma (tabs also converted to commas)
+
+    DataFrame columns returned:
+    ['Timestamp', 'CAN_Type', 'Channel', 'Direction', 'Data_ID', 'Signal_Name']
+    """
+    # Convert selected_filter_strings to a set for faster searching
+    # Exclude empty strings from the filter set
+    filter_set = set(s.strip() for s in selected_filter_strings if s.strip())
+
+    try:
+        logger.debug(f"Reading ASC file '{input_asc_filepath}'...")
+        data = []
+        with open(input_asc_filepath, 'r', encoding='utf-8') as asc_file:
+            for line_num, line in enumerate(asc_file):
+                if interruption_check and interruption_check():
+                    logger.warning("ASC file reading interrupted.")
+                    return pd.DataFrame(columns=ASC_COLUMN_NAMES)
+
+                if line_num < ASC_SKIP_INITIAL_LINES:
+                    continue
+                
+                # --- Original processing logic ---
+                processed_line = line[:ASC_EXTRACT_CHARS_FROM_LEFT].strip()
+                if not processed_line or processed_line.startswith('#'):
+                    continue
+                if len(processed_line) < ASC_MIN_VALID_LINE_LENGTH:
+                    continue
+                if not all(s in processed_line for s in ASC_REQUIRED_COMMON_STRINGS_FIXED):
+                    continue
+                
+                processed_line = re.sub(r' +', ASC_INTERNAL_DELIMITER, processed_line)
+                processed_line = processed_line.replace('\t', ASC_INTERNAL_DELIMITER)
+                processed_line = re.sub(f'{ASC_INTERNAL_DELIMITER}+', ASC_INTERNAL_DELIMITER, processed_line)
+                processed_line = processed_line.strip(ASC_INTERNAL_DELIMITER)
+                
+                fields = processed_line.split(ASC_INTERNAL_DELIMITER)
+
+                # Signal_Name is the last element of ASC_COLUMN_NAMES, index is 5
+                # Skip if there are not enough fields to include Signal_Name
+                if len(fields) < ASC_EXPECTED_FIELD_COUNT:
+                    continue
+
+                # Assume Signal_Name is in fields[5]
+                current_signal_name = fields[5].strip()
+
+                # --- Filtering logic revised: exact match and string length match check ---
+                # If filter_set is not empty, perform filtering
+                if filter_set:
+                    # If current_signal_name does not exactly match any in filter_set, OR
+                    # if the length of current_signal_name does not match any in filter_set, skip.
+                    
+                    # First, check for exact match in filter_set
+                    is_exact_match = current_signal_name in filter_set
+                    
+                    # Next, check if any element in filter_set has the same length as current_signal_name
+                    is_length_match = False
+                    for f_str in filter_set:
+                        if len(f_str) == len(current_signal_name):
+                            is_length_match = True
+                            break # OK if at least one filter matches in length
+
+                    # Skip if either condition is not met
+                    if not is_exact_match or not is_length_match:
+                         continue # Skip
+                # --- Filtering logic revision end ---
+
+                data.append(fields[:ASC_EXPECTED_FIELD_COUNT])
+                
+        if not data:
+            logger.info("No data found in ASC file for the specified conditions.")
+            return pd.DataFrame(columns=ASC_COLUMN_NAMES)
+        df = pd.DataFrame(data, columns=ASC_COLUMN_NAMES)
+        df['Timestamp'] = pd.to_numeric(df['Timestamp'], errors='coerce')
+        df['Channel'] = pd.to_numeric(df['Channel'], errors='coerce')
+        logger.debug(f"Data processing of ASC file '{input_asc_filepath}' completed. Converted to Pandas DataFrame.")
+        return df
+    except FileNotFoundError:
+        logger.error(f"Error: Input file '{input_asc_filepath}' not found.")
+        return pd.DataFrame(columns=ASC_COLUMN_NAMES)
+    except Exception as e:
+        logger.exception(f"An error occurred during ASC file processing: {e}")
+        return pd.DataFrame(columns=ASC_COLUMN_NAMES)
+
+
+def load_priority_definitions(priority_excel_path, parent_app=None): 
+    """
+    Reads priority definitions from the specified Excel file,
+    and returns a map of Msg. Label to Priority.
+    """
+    priority_map = {}
+    priority_for_unknown = None
+    ignored_priorities = []
+    caution_string = None
+    caution_value = None
+    initial_o5_excel_value = None
+    initial_k5_excel_value = None
+    
+    # A list to store the value of O5:BZ5 (reading continues)
+    priority_o5_to_bz5_values = [] 
+
+    try:
+        wb = load_workbook(priority_excel_path, data_only=True)
+        ws = wb[EXCEL_PRIORITY_READ_CONFIG["sheet_name"]]
+
+        logger.debug(f"Reading Priority file '{priority_excel_path}'...")
+        logger.debug(f"Active sheet: '{ws.title}'")
+
+        priority_for_unknown = ws['O23'].value 
+        logger.debug(f"O23 (Priority for unknown) value: {priority_for_unknown}")
+
+        caution_string = ws['O22'].value
+        caution_value = ws['O23'].value 
+        logger.debug(f"O22 (caution string) value: {caution_string}")
+        logger.debug(f"O23 (caution value) value: {caution_value}")
+
+
+        initial_o5_excel_value = ws['O5'].value 
+        logger.debug(f"O5 (initial Top Priority Excel) value: {initial_o5_excel_value}")
+
+        initial_k5_excel_value = ws['K5'].value 
+        logger.debug(f"K5 (initial k5_value Excel) value: {initial_k5_excel_value}")
+
+        # --- B1:BM1 (Priority connected with Msg. Label)roading ---
+        start_col = column_index_from_string('B')       
+        end_col = column_index_from_string('BM')
+
+        priority_excel_row = 1
+        msg_label_excel_row = 2
+
+        logger.debug(f"Reading Priority from row {priority_excel_row}, Msg. Label from row {msg_label_excel_row}")
+        logger.debug(f"Column range from {get_column_letter(start_col)} ({start_col}) to {get_column_letter(end_col)} ({end_col})")
+
+        for col_idx in range(start_col, end_col + 1):
+            msg_label = ws.cell(row=msg_label_excel_row, column=col_idx).value
+            priority = ws.cell(row=priority_excel_row, column=col_idx).value
+
+            msg_label_str = str(msg_label).strip() if msg_label is not None else ""
+
+            if msg_label is not None and msg_label_str != '' and priority is not None:
+                priority_map[msg_label_str] = priority
+
+        # --- O5:BZ5のPriority値を読み込み (読み込み処理は維持) ---
+        start_col_o5 = column_index_from_string('O')
+        end_col_bz5 = column_index_from_string('BZ') # BZ列まで読み込む (64列分確保のため)
+
+        # 5行目の値を読み込む
+        for col_idx in range(start_col_o5, end_col_bz5 + 1):
+            value = ws.cell(row=5, column=col_idx).value
+            if value is not None and value != '':
+                try:
+                    priority_o5_to_bz5_values.append(float(value)) # 数値として格納
+                except ValueError:
+                    logger.warning(f"Priority value '{value}' in cell {get_column_letter(col_idx)}5 is not a valid number. Storing as original.")
+                    priority_o5_to_bz5_values.append(value) # 数値変換できない場合はそのまま格納
+            else:
+                priority_o5_to_bz5_values.append(None) # 値がない場合はNone
+
+        logger.info(f"Read {len(priority_map)} priority definitions from B1:BM1 and {len(priority_o5_to_bz5_values)} values from O5:BZ5 in file '{priority_excel_path}'.")
+        
+        return priority_map, priority_for_unknown, ignored_priorities, caution_string, caution_value, initial_o5_excel_value, initial_k5_excel_value, priority_o5_to_bz5_values
+
+    except FileNotFoundError:
+        messagebox.showerror("File Not Found", f"Priority definition file '{priority_excel_path}' not found.", parent=parent_app) 
+        logger.error(f"Error: Priority definition file '{priority_excel_path}' not found.")
+        return {}, None, [], None, None, None, None, []
+    except Exception as e:
+        messagebox.showerror("Error", f"An error occurred while loading priority definition: {e}", parent=parent_app) 
+        logger.exception(f"Error: An error occurred while loading priority definition: {e}")
+        return {}, None, [], None, None, None, None, []
+
+# load_fixed_strings_from_excel 関数
+def load_fixed_strings_from_excel(excel_filepath, parent_window=None):
+    """
+    GUIの優先度入力画面用の初期データをExcelから読み込む。
+    """
+    empty_data = [[""] * EXPECTED_ENTRIES_PER_ROW for _ in range(NUM_INPUT_ROWS)] 
+
+    if not excel_filepath:
+        logger.debug("Excel filepath is empty. Returning empty data.")
+        return empty_data 
+
+    try:
+        wb = load_workbook(excel_filepath, data_only=True) 
+        if EXCEL_PRIORITY_READ_CONFIG["sheet_name"] not in wb.sheetnames:
+            messagebox.showerror("Error", f"Sheet '{EXCEL_PRIORITY_READ_CONFIG['sheet_name']}' not found in Excel file '{excel_filepath}'.", parent=parent_window)
+            logger.error(f"Sheet '{EXCEL_PRIORITY_READ_CONFIG['sheet_name']}' not found in Excel file '{excel_filepath}'.")
+            return None
+        ws = wb[EXCEL_PRIORITY_READ_CONFIG["sheet_name"]] 
+        
+        loaded_data_for_gui_rows = []
+        for row_idx, cell_range in enumerate(EXCEL_PRIORITY_READ_CONFIG["ranges"]):
+            if row_idx >= NUM_INPUT_ROWS: break 
+            extracted_cols = []
+            for r in ws[cell_range]: 
+                for cell in r: 
+                    extracted_cols.append(str(cell.value if cell.value is not None else "")) 
+            
+            processed_row_data = []
+            for i in range(EXPECTED_ENTRIES_PER_ROW):
+                if i < len(extracted_cols):
+                    processed_row_data.append(extracted_cols[i])
+                else:
+                    processed_row_data.append("") 
+            loaded_data_for_gui_rows.append(processed_row_data)
+        
+        while len(loaded_data_for_gui_rows) < NUM_INPUT_ROWS:
+            loaded_data_for_gui_rows.append([""] * EXPECTED_ENTRIES_PER_ROW)
+
+        logger.info(f"Fixed strings loaded from Excel: {excel_filepath}")
+        return loaded_data_for_gui_rows
+
+    except FileNotFoundError:
+        messagebox.showerror("Error", f"Excel file not found: {excel_filepath}", parent=parent_window)
+        logger.error(f"Excel file not found: {excel_filepath}")
+        return None
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to load Excel data: {e}", parent=parent_window)
+        logger.exception(f"Failed to load Excel data from {excel_filepath}.")
+        return None
+
+# get_fixed_strings_from_gui 関数
+def get_fixed_strings_from_gui(initial_data_from_excel=None, parent_window=None): 
+    """
+    GUIで優先度入力画面を表示し、ユーザーからの固定文字列入力を取得する。
+    """
+    if initial_data_from_excel is None:
+        initial_data_from_excel = [[""] * EXPECTED_ENTRIES_PER_ROW for _ in range(NUM_INPUT_ROWS)]
+
+    input_window = tk.Toplevel(parent_window) 
+    input_window.title("Input priority") 
+    
+    screen_width = input_window.winfo_screenwidth()
+    screen_height = input_window.winfo_screenheight()
+    window_width = int(screen_width * 0.5) 
+    window_height = int(screen_height * 0.5) 
+    input_window.geometry(f"{window_width}x{window_height}")
+    
+    input_window.resizable(True, True) 
+
+    help_label = tk.Label(input_window, text=f"Enter data into each field.\nIf a field is left blank, it will be treated as empty.\n(Each column has {NUM_INPUT_ROWS} rows of input.)")
+    help_label.pack(pady=5)
+
+    entry_widgets_by_col = [[] for _ in range(EXPECTED_ENTRIES_PER_ROW)] 
+
+    row_titles = [
+        "Frame name", "CANID", "Cycle", "Offset", "KZK", "Available"
+    ]
+
+    result_list = None 
+
+    def on_ok():
+        nonlocal result_list
+        final_ordered_data = [] 
+        collected_data_per_col = [] 
+        for col_entries in entry_widgets_by_col:
+            col_values = []
+            for entry in col_entries:
+                col_values.append(entry.get())
+            collected_data_per_col.append(col_values)
+        
+        for col_data_list in collected_data_per_col:
+            final_ordered_data.extend(col_data_list)
+        
+        if len(final_ordered_data) != EXPECTED_TOTAL_FIXED_STRINGS:
+            messagebox.showerror("Internal Error", f"Data collection failed. {len(final_ordered_data)} items collected instead of {EXPECTED_TOTAL_FIXED_STRINGS}.", parent=input_window)
+            logger.error(f"GUI data collection error: {len(final_ordered_data)} items collected instead of {EXPECTED_TOTAL_FIXED_STRINGS}.")
+            return
+            
+        result_list = final_ordered_data
+        input_window.grab_release() 
+        input_window.destroy()
+        logger.info("Priority input confirmed by user.")
+
+    def on_cancel():
+        nonlocal result_list
+        result_list = None
+        input_window.grab_release() 
+        input_window.destroy()
+        logger.info("Priority input cancelled by user.")
+
+    # Header frame and scrollbar
+    header_container_frame = tk.Frame(input_window)
+    header_container_frame.pack(pady=(10, 0), fill='x', padx=10)
+
+    header_canvas = tk.Canvas(header_container_frame, height=30)
+    header_canvas.pack(fill='both', expand=True)
+
+    header_inner_frame = tk.Frame(header_canvas)
+    header_canvas_window_id = header_canvas.create_window((0, 0), window=header_inner_frame, anchor='nw')
+
+    tk.Label(header_inner_frame, text="", width=10).grid(row=0, column=0, sticky="ew")
+    for i in range(EXPECTED_ENTRIES_PER_ROW):
+        col_title_text = f"[{i+1}]" 
+        tk.Label(header_inner_frame, text=col_title_text, width=5, relief="ridge", borderwidth=1).grid(row=0, column=i+1, padx=0, pady=0) 
+
+    # Main input area frame and scrollbar
+    main_canvas = tk.Canvas(input_window)
+    main_canvas.pack(side='top', fill='both', expand=True, padx=10, pady=5)
+
+    scrollbar_x_main = tk.Scrollbar(input_window, orient='horizontal') 
+    scrollbar_x_main.pack(side='bottom', fill='x')
+    
+    def _sync_xviews(*args):
+        main_canvas.xview(*args)
+        header_canvas.xview(*args)
+
+    scrollbar_x_main.config(command=_sync_xviews)
+
+    def _update_scrollbars(*args):
+        scrollbar_x_main.set(*args)
+
+    main_canvas.config(xscrollcommand=_update_scrollbars)
+    header_canvas.config(xscrollcommand=_update_scrollbars) 
+
+    columns_container_frame = tk.Frame(main_canvas)
+    main_canvas_window_id = main_canvas.create_window((0, 0), window=columns_container_frame, anchor='nw')
+
+    def _on_frame_configure(event):
+        input_window.update_idletasks()
+        
+        # コンテンツの実際の幅を取得
+        actual_content_width = columns_container_frame.winfo_reqwidth()
+        
+        # 意図的にコンテンツの論理的な幅を拡大する乗数 (例: 1.5倍)
+        # この値を調整することで、スクロールバーのノブの長さを制御できます。
+        # 小さくしたい場合は、乗数を大きくします。
+        # ただし、あまり大きくしすぎると、スクロールの終点が遠くなりすぎます。
+        # 適切な値は試行錯誤で調整が必要です。
+        expanded_width = int(actual_content_width * 1.0) # 例として1.5倍にしてみます。
+
+        main_canvas.config(scrollregion=(0, 0, expanded_width, main_canvas.bbox("all")[3]))
+        header_canvas.config(scrollregion=(0, 0, expanded_width, header_canvas.bbox("all")[3]))
+
+        # Canvasの内部ウィンドウの幅も調整し、スクロール時に白い余白が見えにくくする
+        main_canvas.itemconfig(main_canvas_window_id, width=expanded_width)
+        header_canvas.itemconfig(header_canvas_window_id, width=expanded_width)
+
+
+    input_window.bind('<Configure>', _on_frame_configure) 
+    columns_container_frame.bind('<Configure>', _on_frame_configure) 
+    header_inner_frame.bind('<Configure>', _on_frame_configure) 
+
+    # --- Mousewheel scrolling logic for horizontal scroll ---
+    def _on_mousewheel_x(event):
+        scroll_units = 0
+        if event.num == 0 and event.delta: 
+            scroll_units = int(-1 * (event.delta / 30)) 
+        elif event.delta < 0: 
+            scroll_units = 1 
+        elif event.delta > 0: 
+            scroll_units = -1 
+        elif event.num == 4: 
+            scroll_units = -1
+        elif event.num == 5: 
+            scroll_units = 1
+        
+        if scroll_units != 0:
+            main_canvas.xview_scroll(scroll_units, "units")
+            header_canvas.xview_scroll(scroll_units, "units")
+            return "break" 
+
+    main_canvas.bind("<MouseWheel>", _on_mousewheel_x)
+    header_canvas.bind("<MouseWheel>", _on_mousewheel_x)
+    main_canvas.bind("<Button-4>", _on_mousewheel_x)
+    main_canvas.bind("<Button-5>", _on_mousewheel_x)
+    header_canvas.bind("<Button-4>", _on_mousewheel_x)
+    header_canvas.bind("<Button-5>", _on_mousewheel_x)
+
+    for col_idx in range(EXPECTED_ENTRIES_PER_ROW):
+        col_title = f"[{col_idx+1}]" 
+        col_frame = tk.LabelFrame(columns_container_frame, text=col_title)
+        col_frame.pack(side='left', padx=0, pady=5, fill='y', expand=False) 
+
+        for row_offset in range(NUM_INPUT_ROWS):
+            row_label_text = row_titles[row_offset]
+            tk.Label(col_frame, text=row_label_text, anchor='w', width=10).grid(row=row_offset, column=0, sticky='w') 
+            entry = tk.Entry(col_frame, width=10) 
+            
+            if row_offset < len(initial_data_from_excel) and col_idx < len(initial_data_from_excel[row_offset]):
+                entry.insert(0, initial_data_from_excel[row_offset][col_idx])
+
+            entry.grid(row=row_offset, column=1, padx=2, pady=2, sticky='ew')
+            entry_widgets_by_col[col_idx].append(entry)
+            
+    button_frame = tk.Frame(input_window)
+    button_frame.pack(pady=10)
+
+    ok_button = tk.Button(button_frame, text="OK", command=on_ok)
+    ok_button.pack(side='left', padx=10)
+
+    cancel_button = tk.Button(button_frame, text="Cancel", command=on_cancel) 
+    cancel_button.pack(side='right', padx=10)
+
+    input_window.update_idletasks()
+    _on_frame_configure(None) 
+
+
+    input_window.grab_set() 
+    input_window.wait_window(input_window) 
+
+    return result_list
+
+
+def process_and_output_to_excel(asc_file_path, primary_output_excel_path, fixed_strings_list, priority_excel_path, popup_callback=None, interruption_check=None, parent_app=None): 
+    """
+    Processes a single ASC file and outputs the results to the specified Excel file.
+    Updates the file if it exists, otherwise creates a new one.
+    Fixed strings are used from the list passed from the GUI.
+    Data extracted from ASC is processed as a Pandas DataFrame and output to a new sheet.
+
+    :param asc_file_path: Path to the single ASC file to process.
+    :param primary_output_excel_path: Path to the Excel file to update the 'check' sheet.
+    :param fixed_strings_list: List of fixed strings entered by the user from the GUI (expected N*64 items in total).
+    :param priority_excel_path: Path to the Excel file containing priority definitions.
+    :param popup_callback: Callback function to report progress to the GUI (str message, float percent).
+    :param interruption_check: Callback function to check for process interruption (bool).
+    :param parent_app: The MainApplication instance for message box parenting.
+    """
+    NUM_FIXED_ROWS = NUM_INPUT_ROWS
+    NUM_FIXED_COLS = EXPECTED_ENTRIES_PER_ROW
+
+    selected_filter_strings = []
+    ordered_signal_names = [] 
+
+    output_rows_for_signal_names = OUTPUT_ROWS_FOR_SIGNAL_NAMES_AGGREGATED_DATA 
+
+
+    # Define starting row and column for pasting Processed data within the function
+    start_row_processed_data_c28 = OUTPUT_START_ROW_PROCESSED_DATA_C28
+    start_col_letter_processed_data_c28 = OUTPUT_START_COL_LETTER_PROCESSED_DATA_C28
+    start_col_idx_processed_data_c28 = column_index_from_string(start_col_letter_processed_data_c28)
+
+    # Starting position for Grouped_Time_Difference output (from column O)
+    start_row_grouped_time_diff = OUTPUT_START_ROW_PROCESSED_DATA_O28 
+    start_col_letter_grouped_time_diff = OUTPUT_START_COL_LETTER_PROCESSED_DATA_O28 
+    start_col_idx_grouped_time_diff = column_index_from_string(start_col_letter_grouped_time_diff)
+
+
+    logger.info(f"Processing started for ASC: {asc_file_path}, Output: {primary_output_excel_path}")
+
+    if popup_callback:
+        popup_callback("Step 1/10: Loading priority definitions from Excel...", 5) 
+
+    # --- Load priority definitions ---
+    priority_definitions, priority_for_unknown, ignored_priorities, caution_string, caution_value, initial_o5_excel_value, initial_k5_excel_value, priority_o5_to_bz5_values = load_priority_definitions(priority_excel_path, parent_app) 
+    
+    if interruption_check and interruption_check(): 
+        logger.info("Processing interrupted during priority definition loading.")
+        return
+
+    if not priority_definitions and priority_for_unknown is None:
+        logger.warning("Priority definitions could not be loaded, and no unknown priority is set. K column will be empty.")
+    elif not priority_definitions:
+        logger.warning("Priority definitions could not be loaded, K column will use unknown priority.")
+
+    # Default values if caution_string is None or empty
+    if caution_string is None or (isinstance(caution_string, str) and caution_string.strip() == ""):
+        caution_string = "caution" 
+        logger.debug(f"Caution string set to default: '{caution_string}'")
+    if caution_value is None or (isinstance(caution_value, (int, float)) and math.isnan(caution_value)):
+        caution_value = 8621 
+        logger.debug(f"Caution value set to default: '{caution_value}'")
+    
+    # --- Dynamic determination logic for o5_value_numeric (to be written to O5) ---
+    dynamic_o5_value_numeric = 1.0 
+    if initial_o5_excel_value is not None:
+        try:
+            dynamic_o5_value_numeric = float(initial_o5_excel_value)
+        except (ValueError, TypeError):
+            logger.warning(f"Excel O5 cell value '{initial_o5_excel_value}' cannot be converted to a number. Using default value 1.")
+            
+    if fixed_strings_list and len(fixed_strings_list) == EXPECTED_TOTAL_FIXED_STRINGS:
+        logger.debug("Attempting to determine dynamic Top Priority from fixed strings.")
+        found_top_priority = False
+        for col_block_idx in range(NUM_FIXED_COLS):
+            available_flat_idx = (col_block_idx * NUM_INPUT_ROWS) + 5
+            signal_name_flat_idx = (col_block_idx * NUM_INPUT_ROWS) + 0
+
+            if available_flat_idx < len(fixed_strings_list) and signal_name_flat_idx < len(fixed_strings_list):
+                available_str = str(fixed_strings_list[available_flat_idx]).strip()
+                signal_name = str(fixed_strings_list[signal_name_flat_idx]).strip() 
+
+                if available_str == '1': 
+                    if signal_name in priority_definitions:
+                        dynamic_o5_value_numeric = float(priority_definitions[signal_name])
+                        found_top_priority = True
+                        logger.debug(f"Dynamic Top Priority (o5_value_numeric) set to {dynamic_o5_value_numeric} (column {col_block_idx+1}, Signal='{signal_name}').")
+                        break
+                    else:
+                        logger.warning(f"Signal Name '{signal_name}' (column {col_block_idx+1}) not found in priority_definitions. Using default Top Priority.")
+            
+        if not found_top_priority:
+            logger.warning("No column has Available=1. Using default Top Priority ({}).".format(dynamic_o5_value_numeric))
+    else:
+        logger.warning("fixed_strings_list data is incomplete. Using default Top Priority ({}).".format(dynamic_o5_value_numeric))
+
+    o5_value_numeric = dynamic_o5_value_numeric 
+
+    # --- Dynamic determination logic for k5_value_numeric (to be written to K5 as Offset value) ---
+    k5_value_numeric = "" 
+    lowest_priority_found = float('inf') 
+
+    # K5の計算ロジック
+    if fixed_strings_list and len(fixed_strings_list) == EXPECTED_TOTAL_FIXED_STRINGS:
+        logger.debug("Attempting to determine K5 Top Priority based on column number for Available=1 entries.")
+        
+        for col_block_idx in range(NUM_FIXED_COLS):
+            available_flat_idx = (col_block_idx * NUM_FIXED_ROWS) + 5 
+            
+            if available_flat_idx < len(fixed_strings_list):
+                available_str = str(fixed_strings_list[available_flat_idx]).strip()
+
+                if available_str == '1': 
+                    current_col_number = col_block_idx + 1 
+
+                    if current_col_number < lowest_priority_found: 
+                        lowest_priority_found = current_col_number
+                        logger.debug("Found lower K5 priority: Column number {} in column block {}.".format(lowest_priority_found, col_block_idx+1))
+        
+        if lowest_priority_found != float('inf'): 
+            k5_value_numeric = lowest_priority_found
+            logger.debug("K5 Top Priority (k5_value_numeric) set to the lowest column number ({}) among Available=1 columns.".format(k5_value_numeric))
+        else:
+            logger.warning("No columns with 'Available=1' found for K5 Top Priority. K5 will be empty.")
+            k5_value_numeric = "" 
+    else:
+        logger.warning("fixed_strings_list data is incomplete. Using empty value for K5 Top Priority.")
+        k5_value_numeric = ""
+    
+    if popup_callback: popup_callback("Step 2/10: Preparing filters from GUI input...", 10) 
+
+    if fixed_strings_list and len(fixed_strings_list) == EXPECTED_TOTAL_FIXED_STRINGS:
+        logger.debug("Preparing filtering strings extracted from GUI...")
+        for col_offset in range(NUM_FIXED_COLS):
+            idx = (col_offset * NUM_FIXED_ROWS) + 0
+            if idx < len(fixed_strings_list):
+                frame_name_string = str(fixed_strings_list[idx]).strip()
+                if frame_name_string:
+                    selected_filter_strings.append(frame_name_string)
+                    ordered_signal_names.append(frame_name_string) 
+        logger.debug("Filtering strings extracted from GUI: {}".format(selected_filter_strings))
+    else:
+        logger.warning("Fixed string data is incomplete or in an invalid format ({}/{}), so filtering will not be applied.".format(len(fixed_strings_list), EXPECTED_TOTAL_FIXED_STRINGS))
+        selected_filter_strings = []
+
+    if interruption_check and interruption_check(): 
+        logger.info("Processing interrupted during filter string preparation.")
+        return
+
+    all_processed_data_list = []
+
+    try:
+        if popup_callback:
+            popup_callback(f"Step 3/10: Processing ASC file: {os.path.basename(asc_file_path)}...", 15) 
+        logger.info(f"--- Starting processing for ASC file: {os.path.basename(asc_file_path)} ---")
+        processed_df = process_asc_data(asc_file_path, selected_filter_strings, interruption_check)
+        
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during ASC file processing.")
+            return
+
+        logger.debug(f"Number of extracted data from ASC file '{os.path.basename(asc_file_path)}': {len(processed_df) if not processed_df.empty else 0} rows")
+        if not processed_df.empty:
+            all_processed_data_list.append(processed_df)
+            logger.debug(f"Added data from ASC file '{os.path.basename(asc_file_path)}' to temporary list.")
+        else:
+            logger.info(f"No data found to process from ASC file '{os.path.basename(asc_file_path)}'.")
+        logger.info(f"--- Completed processing for ASC file: {os.path.basename(asc_file_path)} ---")
+
+        if not all_processed_data_list:
+            logger.warning("No data found to process from any ASC file.")
+            all_processed_data_df = pd.DataFrame(columns=['Timestamp', 'CAN_Type', 'Channel', 'Direction', 'Data_ID', 'Signal_Name'])
+        else:
+            all_processed_data_df = pd.concat(all_processed_data_list, ignore_index=True)
+            logger.debug(f"Total combined data from all ASC files: {len(all_processed_data_df)} rows")
+
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted after ASC file concatenation.")
+            return
+
+        if popup_callback: popup_callback("Step 4/10: Calculating timestamps and differences...", 25) 
+        if not all_processed_data_df.empty:
+            logger.debug("\nCalculating Timestamp differences...")
+            if 'Timestamp' in all_processed_data_df.columns and pd.api.types.is_numeric_dtype(all_processed_data_df['Timestamp']):
+
+                all_processed_data_df['Global_Time_Difference'] = all_processed_data_df['Timestamp'].diff()
+                logger.debug("Calculated overall Timestamp difference 'Global_Time_Difference'.")
+
+                all_processed_data_df = all_processed_data_df.sort_values(by=['Timestamp']).reset_index(drop=True)
+
+                all_processed_data_df['Previous_Occurance_Timestamp'] = all_processed_data_df.groupby('Signal_Name')['Timestamp'].shift(1)
+
+                all_processed_data_df['Grouped_Time_Difference'] = all_processed_data_df.groupby('Signal_Name')['Timestamp'].diff()
+
+                all_processed_data_df['Grouped_Time_Difference'] = all_processed_data_df['Grouped_Time_Difference'] * 1000
+
+                logger.debug("Calculated Previous_Occurance_Timestamp and Grouped_Time_Difference.")
+
+            else:
+                logger.warning("Warning: 'Timestamp' column not found or is not numeric, skipping difference calculation.")
+                all_processed_data_df['Global_Time_Difference'] = math.nan
+                all_processed_data_df['Grouped_Time_Difference'] = math.nan
+                all_processed_data_df['Previous_Occurance_Timestamp'] = math.nan
+        else:
+            logger.info("No processed data, so calculation was skipped.")
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during timestamp calculation.")
+            return
+
+        if popup_callback: popup_callback("Step 5/10: Aggregating data per Signal Name...", 35) 
+        aggregated_results_df = pd.DataFrame()
+        ordered_aggregated_results_df = pd.DataFrame() 
+
+        if not all_processed_data_df.empty and 'Signal_Name' in all_processed_data_df.columns:
+            logger.debug("\nAggregating per Signal_Name...")
+
+            if not pd.api.types.is_numeric_dtype(all_processed_data_df['Timestamp']):
+                logger.warning("Warning: Timestamp is not numeric, skipping aggregation calculation.")
+            else:
+                aggregated_results_diff = all_processed_data_df.groupby('Signal_Name').agg(
+                    total_count=('Grouped_Time_Difference', 'size'), 
+                    min_ms=('Grouped_Time_Difference', lambda x: x[x > 0].min()), 
+                    max_ms=('Grouped_Time_Difference', 'max'),
+                    ave_ms=('Grouped_Time_Difference', 'mean') 
+                ).reset_index()
+                aggregated_results_diff.columns = ['Signal_Name', 'total_count', 'min_ms', 'max_ms', 'ave_ms']
+
+                aggregated_results_timestamp = all_processed_data_df.groupby('Signal_Name')['Timestamp'].agg(
+                    max_timestamp='max',
+                    min_timestamp='min',
+                    avg_timestamp='mean'
+                ).reset_index()
+
+                aggregated_results_df = pd.merge(aggregated_results_diff, aggregated_results_timestamp, on='Signal_Name', how='left')
+
+                logger.debug("Aggregation per Signal_Name completed.")
+
+            signal_name_to_cycle = {}
+            signal_name_to_available = {}
+
+            if fixed_strings_list and len(fixed_strings_list) == EXPECTED_TOTAL_FIXED_STRINGS:
+                for col_block_idx in range(NUM_FIXED_COLS):
+                    current_flat_idx_s6 = (col_block_idx * NUM_FIXED_ROWS) + 0 
+                    cycle_flat_idx = (col_block_idx * NUM_FIXED_ROWS) + 2 
+                    available_flat_idx = (col_block_idx * NUM_FIXED_ROWS) + 5 
+
+                    if current_flat_idx_s6 < len(fixed_strings_list) and \
+                       cycle_flat_idx < len(fixed_strings_list) and \
+                       available_flat_idx < len(fixed_strings_list):
+                        signal_name = str(fixed_strings_list[current_flat_idx_s6]).strip()
+                        cycle_str = str(fixed_strings_list[cycle_flat_idx]).strip()
+                        available_str = str(fixed_strings_list[available_flat_idx]).strip()
+
+                        try:
+                            cycle_value = float(cycle_str) if cycle_str else math.nan
+                            if signal_name:
+                                signal_name_to_cycle[signal_name] = cycle_value
+                        except ValueError:
+                            logger.warning(f"Warning: Cycle value '{cycle_str}' for Signal Name '{signal_name}' is not a valid number. Skipping.")
+                            signal_name_to_cycle[signal_name] = math.nan
+                        
+                        try:
+                            available_value = 0 if available_str == '0' else 1
+                            if signal_name:
+                                signal_name_to_available[signal_name] = available_value
+                        except Exception: 
+                            logger.warning(f"Warning: Available value '{available_str}' for Signal Name '{signal_name}' is invalid. Assuming 1.")
+                            signal_name_to_available[signal_name] = 1
+
+            if not aggregated_results_df.empty:
+                cycle_df = pd.DataFrame(signal_name_to_cycle.items(), columns=['Signal_Name', 'Cycle_Value'])
+                available_df = pd.DataFrame(signal_name_to_available.items(), columns=['Signal_Name', 'Available_Value'])
+
+                aggregated_results_df = pd.merge(aggregated_results_df, cycle_df, on='Signal_Name', how='left')
+                aggregated_results_df['Cycle_Value'].fillna(math.nan, inplace=True) 
+                aggregated_results_df = pd.merge(aggregated_results_df, available_df, on='Signal_Name', how='left')
+                aggregated_results_df['Available_Value'].fillna(1, inplace=True) 
+
+
+                # Calculate delta (max) [%] and delta (min) [%]
+                aggregated_results_df['delta_max_perc'] = aggregated_results_df.apply(
+                    lambda row: abs(((row['max_ms'] - row['Cycle_Value']) / row['Cycle_Value']) * 100)
+                    if not pd.isna(row['Cycle_Value']) and row['Cycle_Value'] != 0 else math.nan, axis=1
+                )
+                aggregated_results_df['delta_min_perc'] = aggregated_results_df.apply(
+                    lambda row: abs(((row['min_ms'] - row['Cycle_Value']) / row['Cycle_Value']) * 100) 
+                    if not pd.isna(row['Cycle_Value']) and row['Cycle_Value'] != 0 else math.nan, axis=1
+                )
+                logger.debug("Percentage deviation from Cycle value calculated.")
+
+            if ordered_signal_names and not aggregated_results_df.empty:
+                ordered_aggregated_results_df = aggregated_results_df.set_index('Signal_Name').reindex(ordered_signal_names).reset_index()
+                ordered_aggregated_results_df['Available_Value'].fillna(1, inplace=True)
+            else:
+                logger.warning("Warning: Signal_Name order cannot be determined or aggregated results are empty. ordered_aggregated_results_df will remain empty.")
+                ordered_aggregated_results_df = pd.DataFrame() 
+
+
+        else: 
+            logger.info("No aggregated data per Signal_Name, so 'check' sheet was not written.")
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during aggregation.")
+            return
+
+        if popup_callback: popup_callback("Step 6/10: Setting up Excel output file...", 45) 
+        wb_primary = None
+        if os.path.exists(primary_output_excel_path):
+            try:
+                wb_primary = load_workbook(primary_output_excel_path)
+                logger.info(f"Loaded primary Excel file '{primary_output_excel_path}'.")
+            except Exception as e:
+                logger.exception(f"Error: Failed to load primary Excel file '{primary_output_excel_path}'. Creating new one.")
+                wb_primary = Workbook() 
+        else:
+            logger.info(f"Creating new primary Excel file '{primary_output_excel_path}'.")
+            wb_primary = Workbook() 
+
+        ws_check = None
+        if OUTPUT_CHECK_SHEET_NAME not in wb_primary.sheetnames:
+            ws_check = wb_primary.create_sheet(OUTPUT_CHECK_SHEET_NAME, 0) 
+            logger.info(f"Created new '{OUTPUT_CHECK_SHEET_NAME}' sheet.")
+        else:
+            ws_check = wb_primary[OUTPUT_CHECK_SHEET_NAME] 
+            if wb_primary.sheetnames.index(OUTPUT_CHECK_SHEET_NAME) != 0:
+                 wb_primary._sheets.insert(0, wb_primary._sheets.pop(wb_primary.sheetnames.index(OUTPUT_CHECK_SHEET_NAME)))
+            logger.info(f"Pasting data into existing '{OUTPUT_CHECK_SHEET_NAME}' sheet.")
+
+        all_primary_sheetnames_copy = wb_primary.sheetnames[:]
+        for sname in all_primary_sheetnames_copy:
+            if sname != OUTPUT_CHECK_SHEET_NAME:
+                del wb_primary[sname]
+                logger.debug(f"Deleted unnecessary sheet '{sname}' from primary Excel file.")
+
+        wb_primary.active = ws_check 
+
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during Excel file setup.")
+            return
+
+        if popup_callback: popup_callback("Step 7/10: Writing input configuration to Excel...", 55) 
+        if fixed_strings_list and len(fixed_strings_list) == EXPECTED_TOTAL_FIXED_STRINGS:
+            logger.debug("Writing fixed strings to 'check' sheet of primary Excel file (from O6)...")
+            start_col_fixed_string_index = column_index_from_string("O") 
+            for i in range(len(fixed_strings_list)):
+                if interruption_check and interruption_check(): return
+                col_block_idx = i // NUM_FIXED_ROWS 
+                row_offset_in_block = i % NUM_FIXED_ROWS 
+                current_col_letter = get_column_letter(start_col_fixed_string_index + col_block_idx)
+                target_row = TARGET_EXCEL_ROWS[row_offset_in_block] 
+                cell_address = f"{current_col_letter}{target_row}"
+                ws_check[cell_address].value = fixed_strings_list[i]
+            logger.info("Writing fixed strings to primary file 'check' sheet completed.")
+        else:
+            logger.warning(f"Fixed string data is incomplete or in an invalid format ({len(fixed_strings_list)}/{EXPECTED_TOTAL_FIXED_STRINGS} items), skipping writing to 'check' sheet of primary Excel file.")
+
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during fixed strings writing.")
+            return
+
+        if popup_callback: popup_callback("Step 8/10: Pasting processed data and calculating derived values...", 65) 
+        if not all_processed_data_df.empty:
+            logger.debug("Pasting processed data from C28 to 'check' sheet (columns C, D, E, F, G, H, I)...")
+
+            last_data_row_to_be_written = start_row_processed_data_c28 + len(all_processed_data_df) - 1
+
+            clear_start_row_c28 = start_row_processed_data_c28
+            clear_end_row_c28 = last_data_row_to_be_written + 10 
+
+            clear_start_col_c28 = column_index_from_string('C')
+            clear_end_col_c28 = column_index_from_string('I') 
+
+            for row_num in range(clear_start_row_c28, clear_end_row_c28 + 1):
+                if interruption_check and interruption_check(): return
+                for col_num in range(clear_start_col_c28, clear_end_col_c28 + 1):
+                    cell = ws_check.cell(row=row_num, column=col_num)
+                    if row_num > last_data_row_to_be_written:
+                        cell.value = None
+            logger.debug(f"Cleared existing data from C{clear_start_row_c28} to column I of 'check' sheet.")
+
+
+            for r_idx, row_series in enumerate(all_processed_data_df.itertuples(index=False)):
+                if interruption_check and interruption_check(): return
+                excel_row = start_row_processed_data_c28 + r_idx
+
+                global_time_diff = row_series.Global_Time_Difference
+                if isinstance(global_time_diff, float) and math.isnan(global_time_diff):
+                    global_time_diff = None
+
+                timestamp = row_series.Timestamp
+                if isinstance(timestamp, float) and math.isnan(timestamp):
+                    timestamp = None
+                
+                ws_check.cell(row=excel_row, column=column_index_from_string('C'), value=global_time_diff)
+                ws_check.cell(row=excel_row, column=column_index_from_string('D'), value=timestamp)
+                ws_check.cell(row=excel_row, column=column_index_from_string('E'), value=row_series.CAN_Type)
+                ws_check.cell(row=excel_row, column=column_index_from_string('F'), value=row_series.Channel)
+                ws_check.cell(row=excel_row, column=column_index_from_string('G'), value=row_series.Direction)
+                ws_check.cell(row=excel_row, column=column_index_from_string('H'), value=row_series.Data_ID)
+                ws_check.cell(row=excel_row, column=column_index_from_string('I'), value=row_series.Signal_Name)
+                
+                grouped_time_difference = row_series.Grouped_Time_Difference
+                if isinstance(grouped_time_difference, float) and math.isnan(grouped_time_difference):
+                    grouped_time_difference = 0
+                
+                previous_occurance_timestamp = row_series.Previous_Occurance_Timestamp
+                if isinstance(previous_occurance_timestamp, float) and math.isnan(previous_occurance_timestamp):
+                    previous_occurance_timestamp = None
+
+            logger.info(f"Pasted processed data ({len(all_processed_data_df)} rows) to C28 of 'check' sheet.") 
+        else:
+            logger.info(f"No processed data, so nothing was pasted to C28 of 'check' sheet.")
+            clear_start_row_c28 = start_row_processed_data_c28
+            clear_end_row_c28 = start_row_processed_data_c28 + 10 
+            clear_start_col_c28 = column_index_from_string('C')
+            clear_end_col_c28 = column_index_from_string('I') 
+            for row_num in range(clear_start_row_c28, clear_end_col_c28 + 1):
+                if interruption_check and interruption_check(): return
+                for col_num in range(clear_start_col_c28, clear_end_col_c28 + 1):
+                    cell = ws_check.cell(row=row_num, column=col_num)
+                    cell.value = None
+            logger.debug(f"Cleared C{start_row_processed_data_c28} to column I of 'check' sheet because no processed data.")
+
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during C28-I pasting.")
+            return
+
+        col_k_idx_correct = column_index_from_string('K') 
+        col_l_idx_mark = column_index_from_string('L') 
+        col_m_idx = column_index_from_string('M') 
+        col_n_idx = column_index_from_string('N') 
+        col_o_idx = column_index_from_string('O') 
+        col_i_idx = column_index_from_string('I') 
+
+        max_data_row = start_row_processed_data_c28 + len(all_processed_data_df) - 1
+        processing_limit_row = max(ws_check.max_row, max_data_row + 2) 
+
+        clear_start_col_klmn = column_index_from_string('K')
+        clear_end_col_klmn = column_index_from_string('N') 
+        
+        for row_num in range(start_row_processed_data_c28, processing_limit_row + 10): 
+             if interruption_check and interruption_check(): return
+             for col_num in range(clear_start_col_klmn, clear_end_col_klmn + 1):
+                 ws_check.cell(row=row_num, column=col_num).value = None
+             ws_check.cell(row=row_num, column=col_o_idx).value = None
+
+
+        internal_n_values = {} 
+
+        caution_count_in_k_column = 0
+
+        for r_idx in range(start_row_processed_data_c28, processing_limit_row + 1):
+            if interruption_check and interruption_check(): return
+            
+            if r_idx > max_data_row:
+                continue 
+
+            signal_name_val = ws_check.cell(row=r_idx, column=col_i_idx).value 
+            current_signal_name_str = str(signal_name_val).strip() if signal_name_val is not None else ""
+            
+            k_val_for_n = None 
+
+            if current_signal_name_str != "":
+                if current_signal_name_str in priority_definitions:
+                    k_val_for_n = priority_definitions[current_signal_name_str]
+                else:
+                    k_val_for_n = priority_for_unknown 
+
+            corresponding_available_value = None
+            if not aggregated_results_df.empty and current_signal_name_str in aggregated_results_df['Signal_Name'].values:
+                temp_df = aggregated_results_df[aggregated_results_df['Signal_Name'] == current_signal_name_str]
+                if not temp_df.empty:
+                    corresponding_available_value = temp_df.iloc[0]['Available_Value']
+            
+            n_val = None
+            if corresponding_available_value == 0:
+                n_val = None 
+            else:
+                n_val = k_val_for_n
+            
+            if n_val is None or (isinstance(n_val, str) and n_val.strip() == ""):
+                n_val = None
+
+            internal_n_values[r_idx] = n_val
+
+            
+            # K列にCautionを書き込むロジック
+            is_caution_condition = False
+            if corresponding_available_value != 0: 
+                current_n_val_raw_for_calc = n_val 
+                prev_n_val_raw_for_calc = internal_n_values.get(r_idx - 1)
+
+                current_n_val_numeric = None
+                if isinstance(current_n_val_raw_for_calc, (int, float)):
+                    current_n_val_numeric = float(current_n_val_raw_for_calc)
+                elif isinstance(current_n_val_raw_for_calc, str) and current_n_val_raw_for_calc.replace('.', '', 1).isdigit():
+                    current_n_val_numeric = float(current_n_val_raw_for_calc)
+
+                prev_n_val_numeric = None
+                if isinstance(prev_n_val_raw_for_calc, (int, float)):
+                    prev_n_val_numeric = float(prev_n_val_raw_for_calc)
+                elif isinstance(prev_n_val_raw_for_calc, str) and prev_n_val_raw_for_calc.replace('.', '', 1).isdigit():
+                    prev_n_val_numeric = float(prev_n_val_raw_for_calc)
+
+                if current_n_val_numeric is not None and prev_n_val_numeric is not None:
+                    if current_n_val_numeric < prev_n_val_numeric:
+                        if not (round(current_n_val_numeric, 5) == round(o5_value_numeric, 5) or current_n_val_numeric == 0):
+                            is_caution_condition = True
+            
+            if is_caution_condition:
+                ws_check.cell(row=r_idx, column=col_k_idx_correct).value = caution_string
+                caution_count_in_k_column += 1 
+            else:
+                ws_check.cell(row=r_idx, column=col_k_idx_correct).value = None 
+            
+        logger.info("Outputting to K(correct), N columns. O column cleared. L(mark) will reference K column for Caution.")
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during K,L,M,N,O column processing.")
+            return
+
+        if popup_callback: popup_callback("Step 9/10: Processing mark column (L) and updating K5, K23...", 75) 
+        
+        processing_limit_row_l = processing_limit_row 
+
+        # K列のCaution表示に基づいてL列を計算するように変更
+        for r_idx in range(start_row_processed_data_c28, processing_limit_row_l + 1):
+            if interruption_check and interruption_check(): return
+            p_val_mark = None 
+
+            if r_idx > max_data_row:
+                ws_check.cell(row=r_idx, column=col_l_idx_mark).value = None 
+                continue 
+
+            if r_idx == start_row_processed_data_c28: 
+                p_val_mark = 1
+            else:
+                prev_p_val_mark_raw = ws_check.cell(row=r_idx - 1, column=col_l_idx_mark).value
+                prev_p_val_mark = float(prev_p_val_mark_raw) if isinstance(prev_p_val_mark_raw, (int, float)) or \
+                                   (isinstance(prev_p_val_mark_raw, str) and prev_p_val_mark_raw.replace('.', '', 1).isdigit()) else 0.0 
+
+                k_current_is_caution = (str(ws_check.cell(row=r_idx, column=col_k_idx_correct).value).strip() == caution_string)
+                k_minus_1_is_caution = (str(ws_check.cell(row=r_idx - 1, column=col_k_idx_correct).value).strip() == caution_string) if r_idx > start_row_processed_data_c28 else False
+                
+                k_plus_2_is_caution = (str(ws_check.cell(row=r_idx + 2, column=col_k_idx_correct).value).strip() == caution_string) if (r_idx + 2 <= max_data_row) else False
+
+
+                cond1_part1 = abs(prev_p_val_mark) < 2
+                cond1_part2 = k_plus_2_is_caution 
+
+                if cond1_part1 and cond1_part2:
+                    p_val_mark = prev_p_val_mark * 2
+                else:
+                    cond2_part1 = abs(prev_p_val_mark) > 1
+                    cond2_part2 = k_minus_1_is_caution 
+                    cond2_part3 = not k_current_is_caution 
+
+                    if cond2_part1 and cond2_part2 and cond2_part3:
+                        p_val_mark = prev_p_val_mark * -0.5
+                    else:
+                        p_val_mark = prev_p_val_mark * 1 
+            
+            if p_val_mark is None or (isinstance(p_val_mark, (float, int)) and math.isnan(p_val_mark)):
+                p_val_mark = 1
+
+            ws_check.cell(row=r_idx, column=col_l_idx_mark).value = p_val_mark 
+
+        logger.info("L column (mark) processing completed.")
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during L column processing.")
+            return
+
+        logger.debug(f"Output dynamic Top Priority ({o5_value_numeric}) was calculated but O5 cell will not be modified.")
+        
+        ws_check['K5'].value = k5_value_numeric 
+        logger.debug(f"Output dynamic k5_value ({k5_value_numeric}) to K5. Value after setting: {ws_check['K5'].value}")
+
+        ws_check['K23'].value = caution_count_in_k_column 
+        logger.debug(f"Output total Caution in K column ({caution_count_in_k_column}) to K23. Value after setting: {ws_check['K23'].value}")
+
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during O5/K5/K23 update.")
+            return
+
+        if popup_callback: popup_callback("Step 10/10: Pasting grouped time difference and aggregated results...", 85) 
+        if not all_processed_data_df.empty:
+            logger.debug("Pasting Grouped_Time_Difference to 'check' sheet from O28 onwards, distributing to corresponding columns...")
+
+            signal_name_col_map = {}
+            start_col_fixed_string_index_agg = column_index_from_string(OUTPUT_START_COL_LETTER_AGGREGATED_DATA) 
+
+            for col_idx, s_name in enumerate(ordered_signal_names): 
+                excel_col_idx = start_col_fixed_string_index_agg + col_idx
+                signal_name_col_map[s_name] = excel_col_idx
+
+            logger.debug(f"Signal Name to column index mapping (from O column): {signal_name_col_map}")
+
+            last_data_row_to_be_written_o = start_row_grouped_time_diff + len(all_processed_data_df) - 1
+
+            clear_end_row_o = last_data_row_to_be_written_o + 10
+
+            clear_start_col_o28_dynamic = column_index_from_string(OUTPUT_START_COL_LETTER_PROCESSED_DATA_O28) 
+            clear_end_col_o28_dynamic = column_index_from_string('CD')
+
+            for row_num in range(start_row_grouped_time_diff, clear_end_row_o + 1):
+                if interruption_check and interruption_check(): return
+                for col_num in range(clear_start_col_o28_dynamic, clear_end_col_o28_dynamic + 1):
+                    cell = ws_check.cell(row=row_num, column=col_num)
+                    if row_num > last_data_row_to_be_written_o:
+                        cell.value = None
+            logger.debug(f"Cleared existing data from O{start_row_grouped_time_diff} to column CD of 'check' sheet.")
+
+            for r_idx, row_series in all_processed_data_df.iterrows():
+                if interruption_check and interruption_check(): return
+                current_signal_name = row_series['Signal_Name']
+                grouped_time_diff_value = row_series['Grouped_Time_Difference']
+
+                if current_signal_name in signal_name_col_map:
+                    target_excel_col_idx = signal_name_col_map[current_signal_name]
+                    target_excel_row_idx = start_row_grouped_time_diff + r_idx
+
+                    if isinstance(grouped_time_diff_value, float) and math.isnan(grouped_time_diff_value):
+                         cell_value = 0
+                    else:
+                         cell_value = grouped_time_diff_value
+
+                    ws_check.cell(row=target_excel_row_idx, column=target_excel_col_idx, value=cell_value)
+
+            logger.info(f"Pasted Grouped_Time_Difference data ({len(all_processed_data_df)} rows) to 'check' sheet from O{start_row_grouped_time_diff} onwards.")
+        else:
+            logger.info(f"No processed data, so nothing was pasted to 'check' sheet from O{start_row_grouped_time_diff} onwards.")
+            clear_start_row_o = start_row_grouped_time_diff
+            clear_end_row_o = start_row_grouped_time_diff + 10
+            clear_start_col_o28_dynamic = column_index_from_string('O')
+            clear_end_col_o28_dynamic = column_index_from_string('CD')
+            for row_num in range(clear_start_row_o, clear_end_row_o + 1):
+                if interruption_check and interruption_check(): return
+                for col_num in range(clear_start_col_o28_dynamic, clear_end_col_o28_dynamic + 1):
+                    cell = ws_check.cell(row=row_num, column=col_num)
+                    cell.value = None
+            logger.debug(f"Cleared O{start_row_grouped_time_diff} to column CD of 'check' sheet because no processed data.")
+
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during O28-CD pasting.")
+            return
+
+        if not aggregated_results_df.empty:
+            logger.debug("\nWriting aggregated results to 'check' sheet...")
+
+            start_col_signal_names = OUTPUT_START_COL_LETTER_AGGREGATED_DATA 
+
+            output_cols_mapping = {
+                'total_count': {'row': 17, 'col_data_key': 'total_count'},
+                'min_ms': {'row': 18, 'col_data_key': 'min_ms'},
+                'max_ms': {'row': 19, 'col_data_key': 'max_ms'},
+                'ave_ms': {'row': 20, 'col_data_key': 'ave_ms'},
+                'delta_min_perc': {'row': 22, 'col_data_key': 'delta_min_perc'},
+                'delta_max_perc': {'row': 23, 'col_data_key': 'delta_max_perc'},
+            }
+            
+            if not ordered_aggregated_results_df.empty: 
+                for target_row_signal in output_rows_for_signal_names: 
+                    current_col_output_s = column_index_from_string(start_col_signal_names) 
+                    for s_name in ordered_aggregated_results_df['Signal_Name']:
+                        if interruption_check and interruption_check(): return
+                        ws_check.cell(row=target_row_signal, column=current_col_output_s, value=s_name)
+                        current_col_output_s += 1
+                logger.info(f"Output Signal Name to row(s) {', '.join(map(str, output_rows_for_signal_names))}.")
+            else:
+                logger.info("No ordered aggregated results to write Signal Names to Excel.")
+
+            if not ordered_aggregated_results_df.empty: 
+                for col_name, config in output_cols_mapping.items():
+                    if interruption_check and interruption_check(): return
+                    target_row = config['row']
+                    start_col_excel_index = column_index_from_string(OUTPUT_START_COL_LETTER_AGGREGATED_DATA) 
+
+                    if config['col_data_key'] in ordered_aggregated_results_df.columns:
+                        for col_idx_df, row_data in ordered_aggregated_results_df.iterrows():
+                            if row_data['Available_Value'] == 0:
+                                cell_value = ""
+                            else:
+                                value = row_data[config['col_data_key']]
+                                if isinstance(value, float) and math.isnan(value):
+                                    cell_value = ""
+                                else:
+                                    cell_value = value
+                            
+                            target_excel_col = start_col_excel_index + col_idx_df
+                            ws_check.cell(row=target_row, column=target_excel_col, value=cell_value)
+                    else:
+                        logger.warning(f"Warning: Column '{config['col_data_key']}' not found in aggregated results. Skipping.")
+                logger.info("Writing aggregated results to 'check' sheet completed.")
+            else:
+                logger.info("No data to write aggregated results to Excel.")
+
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during aggregated results writing.")
+            return
+
+        if popup_callback: popup_callback("Finalizing: Cleaning up unused cells...", 90) 
+        logger.debug("\nClearing existing formatting...")
+
+        last_data_row_with_data = start_row_processed_data_c28 + len(all_processed_data_df) - 1
+
+        clear_start_row = last_data_row_with_data + 1
+        clear_end_row = ws_check.max_row 
+
+        clear_start_col_idx = column_index_from_string('C')
+        clear_end_col_idx = column_index_from_string('CD')
+
+        if clear_start_row <= clear_end_row:
+            for r_idx in range(clear_start_row, clear_end_row + 1):
+                if interruption_check and interruption_check(): return
+                for col_num in range(clear_start_col_idx, clear_end_col_idx + 1):
+                    cell = ws_check.cell(row=r_idx, column=col_num) 
+                    cell.value = None
+        logger.debug("Cleared cell values below where data ends.")
+
+        if interruption_check and interruption_check(): 
+            logger.info("Processing interrupted during unused cells clearing.")
+            return
+
+        if popup_callback: popup_callback("Finalizing: Saving Excel file...", 95) 
+        try:
+            logger.info(f"--- Starting save process ---")
+            logger.debug(f"Save path: '{primary_output_excel_path}'")
+            wb_primary.save(primary_output_excel_path)
+            logger.info(f"Primary Excel file '{primary_output_excel_path}' successfully saved.")
+            
+            if popup_callback:
+                popup_callback("Processing complete, Excel file successfully saved.", 100) 
+            messagebox.showinfo("Processing Complete", "Processing complete, Excel file successfully saved.", parent=parent_app) 
+
+        except Exception as save_e:
+            logger.exception(f"!!!! Fatal error: An error occurred while saving primary Excel file '{primary_output_excel_path}' !!!!")
+            if popup_callback:
+                popup_callback(f"Error: An error occurred while saving file: {save_e}", 0) 
+            messagebox.showerror("Save Error", f"An error occurred while saving file:\n{save_e}", parent=parent_app) 
+            raise 
+
+    except Exception as e:
+        logger.exception(f"\n!!!! An unexpected error occurred during processing !!!!")
+        if popup_callback: popup_callback(f"An error occurred: {e}", 0) 
+        messagebox.showerror("Processing Error", f"An error occurred during processing:\n{e}", parent=parent_app) 
+        raise
